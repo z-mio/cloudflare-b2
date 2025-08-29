@@ -1,6 +1,9 @@
 import { AwsClient } from 'aws4fetch'
 const UNSIGNABLE_HEADERS = [
   'x-forwarded-proto',
+  'x-forwarded-by',
+  'x-forwarded-for',
+  'x-forwarded-host',
   'x-real-ip',
   'accept-encoding',
   'if-match',
