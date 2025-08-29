@@ -1,208 +1,191 @@
-//
-// Proxy Backblaze S3 compatible API requests, sending notifications to a webhook
-//
-// Adapted from https://github.com/obezuk/worker-signed-s3-template
-//
 import { AwsClient } from 'aws4fetch'
-
 const UNSIGNABLE_HEADERS = [
-    // These headers appear in the request, but are never passed upstream
-    'x-forwarded-proto',
-    'x-real-ip',
-    // We can't include accept-encoding in the signature because Cloudflare
-    // sets the incoming accept-encoding header to "gzip, br", then modifies
-    // the outgoing request to set accept-encoding to "gzip".
-    // Not cool, Cloudflare!
-    'accept-encoding',
-    // Conditional headers are not consistently passed upstream
-    'if-match',
-    'if-modified-since',
-    'if-none-match',
-    'if-range',
-    'if-unmodified-since',
-];
+  'x-forwarded-proto',
+  'x-real-ip',
+  'accept-encoding',
+  'if-match',
+  'if-modified-since',
+  'if-none-match',
+  'if-range',
+  'if-unmodified-since',
+]
+const HTTPS_PROTOCOL = 'https:'
+const HTTPS_PORT = '443'
+const RANGE_RETRY_ATTEMPTS = 3
 
-// URL needs colon suffix on protocol, and port as a string
-const HTTPS_PROTOCOL = "https:";
-const HTTPS_PORT = "443";
-
-// How many times to retry a range request where the response is missing content-range
-const RANGE_RETRY_ATTEMPTS = 3;
-
-// Filter out cf-* and any other headers we don't want to include in the signature
+/**
+ * 工具函数
+ */
 function filterHeaders(headers, env) {
-    // Suppress irrelevant IntelliJ warning
-    // noinspection JSCheckFunctionSignatures
-    return new Headers(Array.from(headers.entries())
-        .filter(pair => !(
-            UNSIGNABLE_HEADERS.includes(pair[0])
-            || pair[0].startsWith('cf-')
-            || ('ALLOWED_HEADERS' in env && !env['ALLOWED_HEADERS'].includes(pair[0]))
-        ))
-    );
+  // noinspection JSCheckFunctionSignatures
+  return new Headers(
+    Array.from(headers.entries()).filter(
+      (pair) =>
+        !(
+          UNSIGNABLE_HEADERS.includes(pair[0]) ||
+          pair[0].startsWith('cf-') ||
+          ('ALLOWED_HEADERS' in env &&
+            !env['ALLOWED_HEADERS'].includes(pair[0]))
+        ),
+    ),
+  )
 }
 
 function createHeadResponse(response) {
-    return new Response(null, {
-        headers: response.headers,
-        status: response.status,
-        statusText: response.statusText
-    });
+  // 对于 HEAD 请求，仅返回响应头与状态码（无响应体）
+  return new Response(null, {
+    headers: response.headers,
+    status: response.status,
+    statusText: response.statusText,
+  })
 }
 
 function isListBucketRequest(env, path) {
-    const pathSegments = path.split('/');
-
-    return (env['BUCKET_NAME'] === "$path" && pathSegments.length < 2) // https://endpoint/bucket-name/
-        || (env['BUCKET_NAME'] !== "$path" && path.length === 0); // https://bucket-name.endpoint/ or https://endpoint/
+  const pathSegments = path.split('/')
+  return (
+    (env['BUCKET_NAME'] === '$path' && pathSegments.length < 2) ||
+    (env['BUCKET_NAME'] !== '$path' && path.length === 0)
+  )
 }
 
-// Supress IntelliJ's "unused default export" warning
+function stripPreSignedParams(url) {
+  // 移除所有预签名相关的查询参数（X-Amz-*），避免与 Worker 的二次签名冲突
+  const keysToDelete = []
+  for (const [key] of url.searchParams) {
+    if (key.toLowerCase().startsWith('x-amz-')) {
+      keysToDelete.push(key)
+    }
+  }
+  for (const key of keysToDelete) {
+    url.searchParams.delete(key)
+  }
+}
+
+/**
+ * Worker 入口
+ */
 // noinspection JSUnusedGlobalSymbols
 export default {
-    async fetch(request, env) {
-        // Only allow GET and HEAD methods
-        if (!['GET', 'HEAD'].includes(request.method)){
-            return new Response(null, {
-                status: 405,
-                statusText: "Method Not Allowed"
-            });
+  async fetch(request, env) {
+    // 仅允许 GET 和 HEAD 方法
+    if (!['GET', 'HEAD'].includes(request.method)) {
+      return new Response(null, {
+        status: 405,
+        statusText: 'Method Not Allowed',
+      })
+    }
+
+    const url = new URL(request.url)
+    url.protocol = HTTPS_PROTOCOL
+    url.port = HTTPS_PORT
+
+    // 移除任何预签名的 S3 查询参数，避免与本次签名冲突
+    stripPreSignedParams(url)
+
+    // 规范化路径（去除前后斜杠）
+    let path = url.pathname.replace(/^\//, '')
+    path = path.replace(/\/$/, '')
+
+    // 禁止列出桶内容，除非显式开启
+    if (
+      isListBucketRequest(env, path) &&
+      String(env['ALLOW_LIST_BUCKET']) !== 'true'
+    ) {
+      return new Response(null, { status: 404, statusText: 'Not Found' })
+    }
+
+    const rcloneDownload = String(env['RCLONE_DOWNLOAD']) === 'true'
+
+    // 根据桶映射模式解析目标主机名
+    switch (env['BUCKET_NAME']) {
+      case '$path':
+        url.hostname = env['B2_ENDPOINT']
+        break
+      case '$host':
+        url.hostname = url.hostname.split('.')[0] + '.' + env['B2_ENDPOINT']
+        break
+      default:
+        url.hostname = env['BUCKET_NAME'] + '.' + env['B2_ENDPOINT']
+        break
+    }
+
+    const headers = filterHeaders(request.headers, env)
+
+    const client = new AwsClient({
+      accessKeyId: env['B2_APPLICATION_KEY_ID'],
+      secretAccessKey: env['B2_APPLICATION_KEY'],
+      service: 's3',
+    })
+
+    const requestMethod = request.method
+
+    // 可选：rclone 下载场景下，移除路径中的 "file/" 前缀
+    if (rcloneDownload) {
+      if (env['BUCKET_NAME'] === '$path') {
+        // 从路径中删除前导文件/前缀
+        url.pathname = path.replace(/^file\//, '')
+      } else {
+        // 从路径中删除前导的 file/{bucket_name}/ 前缀
+        url.pathname = path.replace(/^file\/[^/]+\//, '')
+      }
+    }
+
+    const signedRequest = await client.sign(url.toString(), {
+      method: 'GET',
+      headers: headers,
+    })
+
+    // 针对 Range 请求的特殊处理：若响应缺少 content-range，重试数次
+    if (signedRequest.headers.has('range')) {
+      let attempts = RANGE_RETRY_ATTEMPTS
+      let response
+      do {
+        const controller = new AbortController()
+        response = await fetch(signedRequest.url, {
+          method: signedRequest.method,
+          headers: signedRequest.headers,
+          signal: controller.signal,
+        })
+        if (response.headers.has('content-range')) {
+          if (attempts < RANGE_RETRY_ATTEMPTS) {
+            console.log(
+              `Retry for ${signedRequest.url} succeeded - response has content-range header`,
+            )
+          }
+          break
+        } else if (response.ok) {
+          attempts -= 1
+          console.error(
+            `Range header in request for ${signedRequest.url} but no content-range header in response. Will retry ${attempts} more times`,
+          )
+          if (attempts > 0) {
+            controller.abort()
+          }
+        } else {
+          break
         }
+      } while (attempts > 0)
 
-        const url = new URL(request.url);
+      if (attempts <= 0) {
+        console.error(
+          `Tried range request for ${signedRequest.url} ${RANGE_RETRY_ATTEMPTS} times, but no content-range in response.`,
+        )
+      }
 
-        // Incoming protocol and port is taken from the worker's environment.
-        // Local dev mode uses plain http on 8787, and it's possible to deploy
-        // a worker on plain http. B2 only supports https on 443
-        url.protocol = HTTPS_PROTOCOL;
-        url.port = HTTPS_PORT;
+      if (requestMethod === 'HEAD') {
+        return createHeadResponse(response)
+      }
 
-        // Remove leading slashes from path
-        let path = url.pathname.replace(/^\//, '');
-        // Remove trailing slashes
-        path = path.replace(/\/$/, '');
+      return response
+    }
 
-        // Reject list bucket requests unless configuration allows it
-        if (isListBucketRequest(env, path) && String(env['ALLOW_LIST_BUCKET']) !== "true") {
-            return new Response(null, {
-                status: 404,
-                statusText: "Not Found"
-            });
-        }
+    const fetchPromise = fetch(signedRequest)
 
-        // Set RCLONE_DOWNLOAD to "true" to use rclone with --b2-download-url
-        // See https://rclone.org/b2/#b2-download-url
-        const rcloneDownload = String(env["RCLONE_DOWNLOAD"]) === 'true';
+    if (requestMethod === 'HEAD') {
+      const response = await fetchPromise
+      return createHeadResponse(response)
+    }
 
-        // Set upstream target hostname.
-        switch (env['BUCKET_NAME']) {
-            case "$path":
-                // Bucket name is initial segment of URL path
-                url.hostname = env['B2_ENDPOINT'];
-                break;
-            case "$host":
-                // Bucket name is initial subdomain of the incoming hostname
-                url.hostname = url.hostname.split('.')[0] + '.' + env['B2_ENDPOINT'];
-                break;
-            default:
-                // Bucket name is specified in the BUCKET_NAME variable
-                url.hostname = env['BUCKET_NAME'] + "." + env['B2_ENDPOINT'];
-                break;
-        }
-
-        // Certain headers, such as x-real-ip, appear in the incoming request but
-        // are removed from the outgoing request. If they are in the outgoing
-        // signed headers, B2 can't validate the signature.
-        const headers = filterHeaders(request.headers, env);
-
-        // Create an S3 API client that can sign the outgoing request
-        const client = new AwsClient({
-            "accessKeyId": env['B2_APPLICATION_KEY_ID'],
-            "secretAccessKey": env['B2_APPLICATION_KEY'],
-            "service": "s3",
-        });
-
-        // Save the request method, so we can process responses for HEAD requests appropriately
-        const requestMethod = request.method;
-
-        if (rcloneDownload) {
-            if (env['BUCKET_NAME'] === "$path") {
-                // Remove leading file/ prefix from the path
-                url.pathname = path.replace(/^file\//, "");
-            } else {
-                // Remove leading file/{bucket_name}/ prefix from the path 
-                url.pathname = path.replace(/^file\/[^/]+\//, "");
-            }            
-        }
-
-        // Sign the outgoing request
-        //
-        // For HEAD requests Cloudflare appears to change the method on the outgoing request to GET (#18), which
-        // breaks the signature, resulting in a 403. So, change all HEADs to GETs. This is not too inefficient,
-        // since we won't read the body of the response if the original request was a HEAD.
-        const signedRequest = await client.sign(url.toString(), {
-            method: 'GET',
-            headers: headers
-        });
-
-        // For large files, Cloudflare will return the entire file, rather than the requested range
-        // So, if there is a range header in the request, check that the response contains the
-        // content-range header. If not, abort the request and try again.
-        // See https://community.cloudflare.com/t/cloudflare-worker-fetch-ignores-byte-request-range-on-initial-request/395047/4
-        if (signedRequest.headers.has("range")) {
-            let attempts = RANGE_RETRY_ATTEMPTS;
-            let response;
-            do {
-                let controller = new AbortController();
-                response = await fetch(signedRequest.url, {
-                    method: signedRequest.method,
-                    headers: signedRequest.headers,
-                    signal: controller.signal,
-                });
-                if (response.headers.has("content-range")) {
-                    // Only log if it didn't work first time
-                    if (attempts < RANGE_RETRY_ATTEMPTS) {
-                        console.log(`Retry for ${signedRequest.url} succeeded - response has content-range header`);
-                    }
-                    // Break out of loop and return the response
-                    break;
-                } else if (response.ok) {
-                    attempts -= 1;
-                    console.error(`Range header in request for ${signedRequest.url} but no content-range header in response. Will retry ${attempts} more times`);
-                    // Do not abort on the last attempt, as we want to return the response
-                    if (attempts > 0) {
-                        controller.abort();
-                    }
-                } else {
-                    // Response is not ok, so don't retry
-                    break;
-                }
-            } while (attempts > 0);
-
-            if (attempts <= 0) {
-                console.error(`Tried range request for ${signedRequest.url} ${RANGE_RETRY_ATTEMPTS} times, but no content-range in response.`);
-            }
-
-            if (requestMethod === 'HEAD') {
-                // Original request was HEAD, so return a new Response without a body
-                return createHeadResponse(response);
-            }
-
-            // Return whatever response we have rather than an error response
-            // This response cannot be aborted, otherwise it will raise an exception
-            return response;
-        }
-
-        // Send the signed request to B2
-        const fetchPromise = fetch(signedRequest);
-
-        if (requestMethod === 'HEAD') {
-            const response = await fetchPromise;
-            // Original request was HEAD, so return a new Response without a body
-            return createHeadResponse(response);
-        }
-
-        // Return the upstream response unchanged
-        return fetchPromise;
-    },
-};
+    return fetchPromise
+  },
+}
